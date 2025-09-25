@@ -1,0 +1,125 @@
+import os
+import random
+import shutil
+from pathlib import Path
+import yaml
+from ultralytics import YOLO
+import multiprocessing
+from PIL import Image
+
+# 1. Setup
+script_dir = Path().resolve()
+dataset_dir = script_dir / "BrainTumorDS"   # contains Yes/ and No/
+yolo_root = script_dir / "yolo_brain_dataset"
+test_folder = script_dir / "test"
+
+classes = ["No", "Yes"]
+train_ratio = 0.8
+
+# 2. Create train/val folder structure for each class
+for split in ["train", "val"]:
+    for cls in classes:
+        (yolo_root / split / cls).mkdir(parents=True, exist_ok=True)
+
+# 3. Split images into train and val and copy them
+for cls in classes:
+    cls_path = dataset_dir / cls
+    # check if folder exists
+    if not cls_path.exists():
+        print(f"[ERROR] folder not found: {cls_path}")
+        continue
+    # collect images with extensions jpg/jpeg/png
+    images = [f for f in cls_path.iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+    random.shuffle(images)
+    split_index = int(len(images) * train_ratio)
+    train_imgs = images[:split_index]
+    val_imgs = images[split_index:]
+    # copy to train
+    for img in train_imgs:
+        dest = yolo_root / "train" / cls / img.name
+        shutil.copy(img, dest)
+    # copy to val
+    for img in val_imgs:
+        dest = yolo_root / "val" / cls / img.name
+        shutil.copy(img, dest)
+
+# 4. Create data.yaml
+data_yaml = {
+    'train': str((yolo_root / "train").resolve()).replace("\\", "/"),
+    'val': str((yolo_root / "val").resolve()).replace("\\", "/"),
+    'nc': len(classes),
+    'names': classes
+}
+yaml_path = yolo_root / "data.yaml"
+with yaml_path.open('w') as f:
+    yaml.dump(data_yaml, f)
+print(f"[INFO] data.yaml created at: {yaml_path}")
+
+# 5. Create dummy label files for each image with bounding box covering the whole image
+for split in ["train", "val"]:
+    for cls_id, cls in enumerate(classes):
+        folder = yolo_root / split / cls
+        for img_path in folder.iterdir():
+            if img_path.suffix.lower() in [".jpg", ".jpeg", ".png"]:
+                # open image to get width and height
+                with Image.open(img_path) as img:
+                    w, h = img.size
+                # label file path
+                txt_path = folder / (img_path.stem + ".txt")
+                # YOLO format: class_id x_center y_center width height (all normalized)
+                with open(txt_path, 'w') as f:
+                    f.write(f"{cls_id} 0.5 0.5 1.0 1.0\n")
+
+print("[INFO] dummy labels (whole-image boxes) created for train & val")
+
+# 6. Load the model
+model_name = "yolo11n.pt"   # or any model you want
+model_path = script_dir / model_name
+if model_path.exists():
+    model = YOLO(str(model_path))
+else:
+    print(f"[WARNING] {model_name} not found, using auto-download or default model")
+    model = YOLO(model_name)
+
+# 7. Train and evaluate
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+    print("[INFO] Starting training...")
+    model.train(
+        data=str(yaml_path),
+        epochs=30,
+        batch=4,
+        imgsz=640,
+        device="cpu",  # change to "cuda" if you have a GPU
+        pretrained=True,
+        optimizer='Adam',
+        lr0=0.001,
+        plots=True
+    )
+
+    save_path = script_dir / "best_yolo11n_brain_tumor.pt"
+    model.save(str(save_path))
+    print(f"[INFO] Trained model saved at: {save_path}")
+
+    print("[INFO] Evaluating model on validation set...")
+    metrics = model.val(data=str(yaml_path), split="val", device="cpu")
+    print(metrics)
+
+    # 8. Predict on test images and save results
+    if test_folder.exists():
+        test_images = [f for f in test_folder.iterdir() if f.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+        if not test_images:
+            print(f"[WARNING] No images found in test folder: {test_folder}")
+        else:
+            print(f"[INFO] Predicting on {len(test_images)} test images")
+            results = model.predict(
+                source=str(test_folder),
+                conf=0.5,
+                save=True,           # saves images with boxes and labels
+                save_txt=False,
+                device="cpu"
+            )
+            print(f"[INFO] Prediction results saved at: {results[0].save_dir}")
+    else:
+        print(f"[WARNING] Test folder not found: {test_folder}")
